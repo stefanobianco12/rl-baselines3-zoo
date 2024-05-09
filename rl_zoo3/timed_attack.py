@@ -30,79 +30,38 @@ import matplotlib.pyplot as plt
 #def norms(Z):
  #   return th.norm(Z.flatten(1,-1),p=2, dim=1)
 
+def plot_c(c):
+  # Plot the data
+  #plt.figure(figsize=(8, 6))
+  plt.plot(c[:200])
+  plt.title('Plot of the Numpy Array')
+  plt.xlabel('timesteps')
+  plt.ylabel('c')
+  plt.grid(True)
+  plt.savefig('my_plot.png')
+  plt.show()
+
+def display_image(state):
+  to_pil=transforms.ToPILImage()
+  #frames=[to_pil(frame.squeeze(0)) for frame in state]
+  state_rgb=state.repeat(1,3,1,1)
+
+  output_dir="output_images"
+  os.makedirs(output_dir,exist_ok=True)
+
+
+  for i in range(state_rgb.shape[1]):
+    frame_image=to_pil(state_rgb[0,i])
+    filename=os.path.join(output_dir,f"frame_{i}.png")
+    frame_image.save(filename)
+    print(i)
+  print("Images saved successfully")
+
+
 
 def temperature_scaled_softmax(logits, temperature=1.0):
     logits = logits / temperature
     return th.softmax(logits, dim=1)
-
-def pgd_pipeline_variant(model, X, y, epsilon):
-    niters = 10
-    shape=X.shape
-    step_size = epsilon * 2.5 / niters
-
-    y = obs_as_tensor(y,"cpu")
-    X_tensor=model.policy.obs_to_tensor(X)[0]
-    noise = 2 * epsilon * th.rand(X_tensor.data.size()) - epsilon
-    noise[:, :3, :, :] = 0
-    X_adv = th.clamp(X_tensor.data + noise, 0, 1).clone().detach().requires_grad_(True)
-    for i in range(niters):
-        q_values = model.q_net(X_adv)
-        loss = F.cross_entropy(q_values, y)
-        model.policy.optimizer.zero_grad()
-        loss.backward()
-        eta = step_size * X_adv.grad.data.sign()
-        eta[:, :3, :, :] = 0
-        X_adv.data = X_adv.data + eta
-        X_adv=X_adv.clone().detach().requires_grad_(True)
-        eta = th.clamp(X_adv.data - X_tensor.data, -epsilon, epsilon)
-        eta[:, :3, :, :] = 0
-        X_adv.data = X_tensor.data + eta
-        X_adv.data= th.clamp(X_adv.data, 0, 1)
-        
-
-    ris_tens=X_adv.clone().detach()
-    ris_tens.resize_(shape)
-    return ris_tens.data.numpy()
-
-def stochastic_pgd(model, X, y, epsilon):
-    niters = 10
-    shape=X.shape
-    step_size = epsilon * 2.5 / niters
-
-    y = obs_as_tensor(y,"cpu")
-    X_tensor=model.policy.obs_to_tensor(X)[0]
-    noise = 2 * epsilon * th.rand(X_tensor.data.size()) - epsilon
-    X_adv = th.clamp(X_tensor.data + noise, 0, 1).clone().detach().requires_grad_(True)
-    for i in range(niters):
-        policy_prob=model.policy.get_distribution(X_adv).distribution.probs
-        loss = F.cross_entropy(policy_prob, y)
-        model.policy.optimizer.zero_grad()
-        loss.backward()
-        eta = step_size * X_adv.grad.data.sign()
-        X_adv.data = X_adv.data + eta
-        X_adv=X_adv.clone().detach().requires_grad_(True)
-        eta = th.clamp(X_adv.data - X_tensor.data, -epsilon, epsilon)
-        X_adv.data = X_tensor.data + eta
-        X_adv.data= th.clamp(X_adv.data, 0, 1)
-        
-
-    ris_tens=X_adv.clone().detach()
-    ris_tens.resize_(shape)
-    return ris_tens.data.numpy()
-
-def stochastic_fgsm(model, X, y,epsilon):
-    observation=model.policy.obs_to_tensor(X)[0]
-    observation.requires_grad = True
-    policy_prob=model.policy.get_distribution(observation).distribution.probs
-    loss = F.cross_entropy(policy_prob, obs_as_tensor(y,"cpu"))
-    model.policy.optimizer.zero_grad()
-    loss.backward()
-    eta = epsilon*observation.grad.data.sign()
-    observation.data = observation.data + eta
-    observation.data = th.clamp(observation.data, 0, 1)
-    ris_tens=observation.detach()
-    ris_tens.resize_(X.shape)
-    return ris_tens.cpu().data.numpy()
 
 def norms(Z):
     return th.norm(Z.view(4, -1),p=2, dim=1).unsqueeze(1).unsqueeze(2).expand_as(Z)
@@ -169,6 +128,7 @@ def pgd(model, X, y, epsilon):
 def fgsm(model, X, y,epsilon):
     observation=model.policy.obs_to_tensor(X)[0]
     observation.requires_grad = True
+    #d=model.policy.get_distribution(observation[0]).distribution.probs
     q_values = model.policy.q_net(observation)
     loss = F.cross_entropy(q_values, obs_as_tensor(y,"cpu"))
     model.policy.optimizer.zero_grad()
@@ -383,32 +343,40 @@ def enjoy() -> None:  # noqa: C901
     idx=0
     ep_rew=[]
     num_attack=0
+    series=[]
     try:
         #for _ in generator:
         for _ in tqdm(range(num_ep)):
           end_ep=False
           while not end_ep:
-            observation = obs_as_tensor(obs, "cpu").float()/255
-            np_obs=observation.data.numpy()
+            #observation = obs_as_tensor(obs, "cpu").float()/255
+            state_tensor=model.policy.obs_to_tensor(obs)[0]/255
+            state_tensor.resize_(obs.shape)
+            np_obs=state_tensor.data.numpy()
             action, lstm_states = model.predict(
                   np_obs,  # type: ignore[arg-type]
                   state=lstm_states,
                   episode_start=episode_start,
                   deterministic=deterministic,
-              ) 
-              
-            if idx % args.frq ==0:
+              )
+            state_tensor=model.policy.obs_to_tensor(np_obs)[0]  
+            with th.no_grad():
+              logits = model.policy.q_net(state_tensor)
+            c=temperature_scaled_softmax(logits,1)
+            diff=th.max(c)-th.min(c)
+            series.append(diff.numpy())
+            if diff>=args.beta:
               num_attack+=1
-              #obs_adv=fgsm(model,np_obs,action,args.eps)
-              obs_adv=pgd(model,np_obs,action,args.eps)
-              #obs_adv=pgd_l2(model,np_obs,action,args.eps)
-              action, lstm_states = model.predict(
+              if idx % args.frq ==0:
+                #obs_adv=fgsm(model,np_obs,action,args.eps)
+                obs_adv=pgd(model,np_obs,action,args.eps)
+                #obs_adv=pgd_l2(model,np_obs,action,args.eps)
+                action, lstm_states = model.predict(
                     obs_adv,  # type: ignore[arg-type]
                     state=lstm_states,
                     episode_start=episode_start,
                     deterministic=deterministic,
                 )
-		          
 
             
             
@@ -438,6 +406,8 @@ def enjoy() -> None:  # noqa: C901
                         obs=env.reset()
                         print("Num Attack: ",num_attack)
                         num_attack=0
+                        #plot_c(series)
+                        series=[]
                         
                         print(f"Atari Episode Score: {episode_infos['r']:.2f}")
                         print("Atari Episode Length", episode_infos["l"])
@@ -478,6 +448,7 @@ def enjoy() -> None:  # noqa: C901
         print(f"Mean episode length: {np.mean(episode_lengths):.2f} +/- {np.std(episode_lengths):.2f}")
 
     env.close()
+    #plot_c(series)
 
 
 if __name__ == "__main__":
